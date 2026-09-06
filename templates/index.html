@@ -61,7 +61,16 @@ function render(d){
  let s=d.last_updated?'Latest stream activity: '+d.last_updated:'No stream activity yet'; if(d.using_cached_snapshot)s+=' — displaying last good snapshot while upstream reconnects.'; $('status').textContent=s;
 }
 async function loadSummary(){if(busy)return;busy=true;$('status').textContent='Loading live senatorial simulation results…';try{render(await getJSON('/api/summary'+query(),{cache:'no-store'}))}catch(e){$('status').textContent=e.message+' — automatic retry will continue.'}finally{busy=false}}
-$('printResultsBtn').addEventListener('click',()=>{const c=$('county').selectedOptions[0]?.text||'All Counties',k=$('constituency').selectedOptions[0]?.text||'All Constituencies',w=$('ward').selectedOptions[0]?.text||'All Wards';$('printMeta').textContent=`TRAINING / SIMULATION ONLY — ${c} — ${k} — ${w} — Printed ${new Date().toLocaleString()}`;window.print()});
+$('printResultsBtn').addEventListener('click',()=>{
+  const c=$('county').selectedOptions[0]?.text||'All Counties', k=$('constituency').selectedOptions[0]?.text||'All Constituencies', w=$('ward').selectedOptions[0]?.text||'All Wards';
+  const table=$('senatorialResultsCard').querySelector('table').outerHTML;
+  const pw=window.open('','_blank','width=900,height=700');
+  if(!pw){alert('Please allow pop-ups for this site to print results.');return;}
+  const meta=`TRAINING / SIMULATION ONLY — ${c} — ${k} — ${w} — Printed ${new Date().toLocaleString()}`;
+  pw.document.open();
+  pw.document.write(`<!doctype html><html><head><title>Senatorial Candidate Results</title><style>body{font-family:Arial,sans-serif;color:#111;margin:28px}h1{font-size:22px;margin:0 0 6px}.meta{font-size:12px;color:#555;margin:0 0 18px}table{border-collapse:collapse;width:100%;font-size:14px}th,td{padding:9px 8px;border-bottom:1px solid #ccc;text-align:left}th{background:#f3f3f3}th.num,td.num{text-align:right}@page{size:A4;margin:14mm}</style></head><body><h1>Senatorial Candidate Results</h1><div class="meta">${meta}</div>${table}<script>window.onload=()=>{setTimeout(()=>window.print(),50)}<\/script></body></html>`);
+  pw.document.close();
+});
 $('county').addEventListener('change',loadConstituencies);$('constituency').addEventListener('change',loadWards);$('applyBtn').addEventListener('click',loadSummary);$('refreshBtn').addEventListener('click',async()=>{if(busy)return;$('status').textContent='Refreshing upstream snapshot…';try{await getJSON('/api/refresh',{method:'POST'});await loadSummary()}catch(e){$('status').textContent=e.message}});
 (async()=>{await loadLocations();await loadSummary();setInterval(loadSummary,15000)})();
 </script>
