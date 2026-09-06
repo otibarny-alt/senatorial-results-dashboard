@@ -290,6 +290,98 @@ def build_summary(county='', constituency='', ward=''):
     }
 
 
+def build_stream_status(county='', constituency='', ward='', submission_status='all', page=1, page_size=100):
+    """Fast paginated stream submission view built from local hierarchy + cached live snapshot."""
+    geo = load_geo()
+    key = (norm(county), norm(constituency), norm(ward))
+    expected = geo['expected_by_filter'].get(key, [])
+
+    # Reuse the snapshot already loaded by the dashboard whenever possible so this
+    # list does not create a second upstream request during normal page loading.
+    snap = _cache.get('snapshot')
+    if snap is None:
+        snap = fetch_snapshot()
+
+    live_by_stream = {}
+    for row in (snap.get('streams') or []):
+        skey = norm(row.get('stream'))
+        if skey:
+            live_by_stream[skey] = row
+
+    wanted = str(submission_status or 'all').strip().lower()
+    rows = []
+    submitted_count = 0
+    not_submitted_count = 0
+
+    for skey in expected:
+        g = geo['by_stream'].get(skey, {})
+        live = live_by_stream.get(skey, {})
+        live_status = str(live.get('status') or '').strip().upper()
+        submitted = live_status == 'CLOSED'
+        if submitted:
+            submitted_count += 1
+        else:
+            not_submitted_count += 1
+
+        if wanted == 'submitted' and not submitted:
+            continue
+        if wanted == 'not_submitted' and submitted:
+            continue
+
+        rows.append({
+            'county': g.get('county_label') or friendly(g.get('county')),
+            'constituency': g.get('constituency_label') or friendly(g.get('constituency')),
+            'ward': g.get('ward_label') or friendly(g.get('ward')),
+            'poll_station': friendly(g.get('poll_station')),
+            'stream': g.get('stream') or live.get('stream') or '',
+            'submission_status': 'CLOSED & SUBMITTED' if submitted else 'NOT YET SUBMITTED',
+            'operational_status': live_status if live_status in {'OPEN', 'CLOSED'} else 'NOT STARTED',
+            'opened_at': live.get('opened_at') or '',
+            'closed_at': live.get('closed_at') or '',
+        })
+
+    rows.sort(key=lambda r: (
+        norm(r['county']), norm(r['constituency']), norm(r['ward']),
+        norm(r['poll_station']), norm(r['stream'])
+    ))
+
+    try:
+        page = max(1, int(page))
+    except Exception:
+        page = 1
+    try:
+        page_size = min(200, max(25, int(page_size)))
+    except Exception:
+        page_size = 100
+
+    total_filtered = len(rows)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    if page > total_pages:
+        page = total_pages
+    start = (page - 1) * page_size
+    page_rows = rows[start:start + page_size]
+
+    return {
+        'filters': {
+            'county': county,
+            'constituency': constituency,
+            'ward': ward,
+            'submission_status': wanted,
+        },
+        'counts': {
+            'expected_streams': len(expected),
+            'submitted': submitted_count,
+            'not_submitted': not_submitted_count,
+            'filtered': total_filtered,
+        },
+        'page': page,
+        'page_size': page_size,
+        'total_pages': total_pages,
+        'rows': page_rows,
+        'snapshot_age_seconds': max(0, int(time.time() - _cache['snapshot_at'])) if _cache['snapshot_at'] else None,
+    }
+
+
 @app.get('/')
 @login_required
 def index():
@@ -301,6 +393,22 @@ def index():
 def api_summary():
     try:
         return jsonify(build_summary(request.args.get('county', ''), request.args.get('constituency', ''), request.args.get('ward', '')))
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 503
+
+
+@app.get('/api/stream-status')
+@login_required
+def api_stream_status():
+    try:
+        return jsonify(build_stream_status(
+            request.args.get('county', ''),
+            request.args.get('constituency', ''),
+            request.args.get('ward', ''),
+            request.args.get('submission_status', 'all'),
+            request.args.get('page', 1),
+            request.args.get('page_size', 100),
+        ))
     except Exception as exc:
         return jsonify({'error': str(exc)}), 503
 

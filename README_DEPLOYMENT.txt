@@ -24,3 +24,11 @@ AGENTS_LOGIN_FILENAME=agents_login.csv
 
 The dashboard server calls only the Voting Simulation senator feed: /api/dashboard/senator
 No direct DATABASE_URL is required for this dashboard.
+
+V4 FAST STREAM SUBMISSION FILTER
+- Adds a paginated Polling Station Stream Submission Status section.
+- Filters: All Streams, Closed & Submitted, Not Yet Submitted.
+- Uses the same cached senatorial snapshot already loaded by the dashboard, so it does not create a second upstream call during normal loading.
+- Uses local county_main.csv hierarchy to classify every expected stream, including streams that have never opened.
+- Page size is 100 streams to keep browser rendering fast.
+- No new environment variables are required.
