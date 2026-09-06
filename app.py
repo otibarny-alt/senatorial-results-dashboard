@@ -33,6 +33,9 @@ def norm(v):
     return re.sub(r'[-_\s]+', ' ', str(v or '').strip().lower()).strip()
 
 
+def geo_key(county, constituency, ward, poll_station, stream):
+    return '|'.join((norm(county), norm(constituency), norm(ward), norm(poll_station), norm(stream)))
+
 def friendly(v):
     text = str(v or '').strip()
     return re.sub(r'\s+', ' ', re.sub(r'[_-]+', ' ', text)).title() if text else ''
@@ -85,7 +88,7 @@ def load_geo():
     with open(path, encoding='utf-8-sig', errors='replace', newline='') as f:
         rows = list(csv.DictReader(f))
 
-    counties, constituencies, wards, stations, streams = {}, {}, {}, {}, {}
+    counties, constituencies, wards, stations, streams = {}, {}, {}, {}, []
     for r in rows:
         kind, name = r.get('list_name', ''), r.get('name', '')
         if not name:
@@ -95,7 +98,7 @@ def load_geo():
         elif kind == 'constituency': constituencies[norm(name)] = item
         elif kind == 'ward': wards[norm(name)] = item
         elif kind == 'poll_station': stations[norm(name)] = item
-        elif kind == 'poll_station_stream': streams[norm(name)] = item
+        elif kind == 'poll_station_stream': streams.append(item)
 
     by_stream = {}
     counties_ui = {}
@@ -103,7 +106,7 @@ def load_geo():
     wards_ui = defaultdict(dict)
     expected_by_filter = defaultdict(list)
 
-    for _, srow in streams.items():
+    for srow in streams:
         station = stations.get(norm(srow.get('poll_station_key')), {})
         ward = wards.get(norm(station.get('ward_key')), {})
         constituency = constituencies.get(norm(ward.get('constituency_key')), {})
@@ -118,7 +121,9 @@ def load_geo():
             'poll_station': station.get('name', ''),
             'stream': srow.get('name', ''),
         }
-        skey = norm(geo['stream'])
+        skey = geo_key(geo['county'], geo['constituency'], geo['ward'], geo['poll_station'], geo['stream'])
+        if skey in by_stream:
+            continue
         by_stream[skey] = geo
 
         ck, cok, wk = norm(geo['county']), norm(geo['constituency']), norm(geo['ward'])
@@ -215,8 +220,12 @@ def build_summary(county='', constituency='', ward=''):
             candidate_names[cid] = c.get('name') or cid
 
     for row in stream_rows:
-        skey = norm(row.get('stream'))
-        if skey not in allowed:
+        # Filter by the geography carried by the live event itself. Stream names are not globally unique.
+        if county and norm(row.get('county')) != norm(county):
+            continue
+        if constituency and norm(row.get('constituency')) != norm(constituency):
+            continue
+        if ward and norm(row.get('ward')) != norm(ward):
             continue
         status = str(row.get('status') or '').upper()
         if status in {'OPEN', 'CLOSED'}: opened += 1
@@ -231,7 +240,7 @@ def build_summary(county='', constituency='', ward=''):
         t = row.get('closed_at') or row.get('opened_at') or ''
         if t > last_updated: last_updated = t
 
-    registered = sum(reg.get(skey, 0) for skey in expected)
+    registered = sum(reg.get(norm((geo['by_stream'].get(skey) or {}).get('stream')), 0) for skey in expected)
     expected_count = len(expected)
     not_started = max(0, expected_count - opened)
     total_votes_not_cast = max(0, registered - participants)
@@ -304,8 +313,8 @@ def build_stream_status(county='', constituency='', ward='', submission_status='
 
     live_by_stream = {}
     for row in (snap.get('streams') or []):
-        skey = norm(row.get('stream'))
-        if skey:
+        skey = geo_key(row.get('county'), row.get('constituency'), row.get('ward'), row.get('poll_station'), row.get('stream'))
+        if row.get('stream'):
             live_by_stream[skey] = row
 
     wanted = str(submission_status or 'all').strip().lower()
