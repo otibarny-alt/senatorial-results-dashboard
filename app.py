@@ -30,6 +30,8 @@ CACHE_SECONDS = max(3, int(os.getenv('CACHE_SECONDS', '10')))
 UPSTREAM_TIMEOUT_SECONDS = max(5.0, float(os.getenv('UPSTREAM_TIMEOUT_SECONDS', '30')))
 AUTH_USERNAME = os.getenv('AUTH_USERNAME', '').strip()
 AUTH_PASSWORD_HASH = os.getenv('AUTH_PASSWORD_HASH', '').strip()
+# Test candidates for this county-based contest are registered in Kisumu.
+CANDIDATE_DEFAULT_COUNTY = os.getenv('CANDIDATE_DEFAULT_COUNTY', 'Kisumu').strip()
 SMTP_HOST = os.getenv('SMTP_HOST', '').strip()
 SMTP_PORT = int(os.getenv('SMTP_PORT', '587') or 587)
 SMTP_USERNAME = os.getenv('SMTP_USERNAME', '').strip()
@@ -244,7 +246,7 @@ def build_summary(county='', constituency='', ward=''):
         cid = str(c.get('candidate_id', '') or '')
         if cid:
             candidate_names[cid] = c.get('name') or cid
-            candidate_counties[cid] = candidate_county(c)
+            candidate_counties[cid] = candidate_county(c) or friendly(CANDIDATE_DEFAULT_COUNTY)
 
     for row in stream_rows:
         # Filter by the geography carried by the live event itself. Stream names are not globally unique.
@@ -289,17 +291,22 @@ def build_summary(county='', constituency='', ward=''):
                 cid = str(c.get('candidate_id', '') or '')
                 if cid:
                     candidate_names[cid] = c.get('name') or cid
-                    candidate_counties[cid] = candidate_county(c)
+                    candidate_counties[cid] = candidate_county(c) or candidate_counties.get(cid) or friendly(CANDIDATE_DEFAULT_COUNTY)
                     candidate_votes[cid] = to_int(c.get('votes'))
             total_votes_not_cast = max(0, registered - participants)
 
     candidates = []
     for cid in set(candidate_names) | set(candidate_votes):
         votes = candidate_votes.get(cid, 0)
+        registered_county = candidate_counties.get(cid) or friendly(CANDIDATE_DEFAULT_COUNTY)
+        # Senator candidates belong to one county and must not be listed as
+        # zero-vote candidates under any other selected county.
+        if county and norm(registered_county) != norm(county):
+            continue
         candidates.append({
             'candidate_id': cid,
             'candidate': candidate_names.get(cid, cid),
-            'county': candidate_counties.get(cid) or (friendly(county) if county else 'County Not Provided'),
+            'county': registered_county or 'County Not Provided',
             'votes': votes,
             'share': round((votes / candidate_selections * 100), 2) if candidate_selections else 0,
         })
