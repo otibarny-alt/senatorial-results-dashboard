@@ -1,4 +1,7 @@
-import os, csv, re, time, threading
+import os, csv, re, time, threading, smtplib, ssl
+from html import escape
+from io import BytesIO
+from email.message import EmailMessage
 from functools import wraps
 from collections import defaultdict
 
@@ -6,6 +9,12 @@ import requests
 from flask import Flask, jsonify, render_template, request, redirect, url_for, session, flash
 from werkzeug.security import check_password_hash
 from dotenv import load_dotenv
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
@@ -21,6 +30,14 @@ CACHE_SECONDS = max(3, int(os.getenv('CACHE_SECONDS', '10')))
 UPSTREAM_TIMEOUT_SECONDS = max(5.0, float(os.getenv('UPSTREAM_TIMEOUT_SECONDS', '30')))
 AUTH_USERNAME = os.getenv('AUTH_USERNAME', '').strip()
 AUTH_PASSWORD_HASH = os.getenv('AUTH_PASSWORD_HASH', '').strip()
+SMTP_HOST = os.getenv('SMTP_HOST', '').strip()
+SMTP_PORT = int(os.getenv('SMTP_PORT', '587') or 587)
+SMTP_USERNAME = os.getenv('SMTP_USERNAME', '').strip()
+SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '')
+SMTP_FROM_EMAIL = os.getenv('SMTP_FROM_EMAIL', SMTP_USERNAME).strip()
+SMTP_FROM_NAME = os.getenv('SMTP_FROM_NAME', '2027 Senatorial Simulation Results').strip()
+SMTP_USE_TLS = os.getenv('SMTP_USE_TLS', 'true').strip().lower() in {'1','true','yes','on'}
+SMTP_USE_SSL = os.getenv('SMTP_USE_SSL', 'false').strip().lower() in {'1','true','yes','on'}
 
 _http = requests.Session()
 _fetch_lock = threading.Lock()
@@ -46,6 +63,14 @@ def to_int(v):
         return int(float(str(v or '0').replace(',', '').strip()))
     except Exception:
         return 0
+
+
+def candidate_county(record):
+    record = record or {}
+    for key in ('county', 'county_name', 'candidate_county', 'home_county', 'selected_county'):
+        if record.get(key):
+            return friendly(record.get(key))
+    return ''
 
 
 def login_required(fn):
@@ -209,6 +234,7 @@ def build_summary(county='', constituency='', ward=''):
     stream_rows = snap.get('streams') or []
 
     candidate_names = {}
+    candidate_counties = {}
     candidate_votes = defaultdict(int)
     candidate_selections = skipped = participants = 0
     opened = closed = 0
@@ -218,6 +244,7 @@ def build_summary(county='', constituency='', ward=''):
         cid = str(c.get('candidate_id', '') or '')
         if cid:
             candidate_names[cid] = c.get('name') or cid
+            candidate_counties[cid] = candidate_county(c)
 
     for row in stream_rows:
         # Filter by the geography carried by the live event itself. Stream names are not globally unique.
@@ -234,8 +261,10 @@ def build_summary(county='', constituency='', ward=''):
         skipped += to_int(row.get('skipped'))
         participants += to_int(row.get('participants'))
         names = row.get('candidate_names') or {}
+        counties = row.get('candidate_counties') or {}
         for cid, n in (row.get('candidate_votes') or {}).items():
             candidate_names[cid] = names.get(cid) or candidate_names.get(cid) or cid
+            candidate_counties[cid] = friendly(counties.get(cid)) or candidate_counties.get(cid, '') or friendly(row.get('county'))
             candidate_votes[cid] += to_int(n)
         t = row.get('closed_at') or row.get('opened_at') or ''
         if t > last_updated: last_updated = t
@@ -260,6 +289,7 @@ def build_summary(county='', constituency='', ward=''):
                 cid = str(c.get('candidate_id', '') or '')
                 if cid:
                     candidate_names[cid] = c.get('name') or cid
+                    candidate_counties[cid] = candidate_county(c)
                     candidate_votes[cid] = to_int(c.get('votes'))
             total_votes_not_cast = max(0, registered - participants)
 
@@ -269,6 +299,7 @@ def build_summary(county='', constituency='', ward=''):
         candidates.append({
             'candidate_id': cid,
             'candidate': candidate_names.get(cid, cid),
+            'county': candidate_counties.get(cid) or (friendly(county) if county else 'County Not Provided'),
             'votes': votes,
             'share': round((votes / candidate_selections * 100), 2) if candidate_selections else 0,
         })
@@ -420,6 +451,129 @@ def api_stream_status():
         ))
     except Exception as exc:
         return jsonify({'error': str(exc)}), 503
+
+
+def valid_email(value):
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", str(value or '').strip()))
+
+
+def build_results_pdf(summary):
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4, rightMargin=16*mm, leftMargin=16*mm,
+        topMargin=14*mm, bottomMargin=14*mm,
+        title='Senatorial Candidate Results - Training Simulation Only'
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('TitleCenter', parent=styles['Title'], alignment=TA_CENTER, fontSize=16, leading=20, spaceAfter=6)
+    notice_style = ParagraphStyle('Notice', parent=styles['Normal'], alignment=TA_CENTER, fontSize=9, leading=12, textColor=colors.HexColor('#A14E00'), spaceAfter=10)
+    meta_style = ParagraphStyle('Meta', parent=styles['Normal'], fontSize=9, leading=12, spaceAfter=10)
+    story = [
+        Paragraph('2027 Senatorial Simulation Results', title_style),
+        Paragraph('<b>TRAINING / SIMULATION ONLY — NON-BINDING</b>', notice_style),
+    ]
+    f = summary.get('filters') or {}
+    county = friendly(f.get('county')) or 'All Counties'
+    constituency = friendly(f.get('constituency')) or 'All Constituencies'
+    ward = friendly(f.get('ward')) or 'All Wards'
+    story.append(Paragraph(f'<b>County:</b> {escape(county)}<br/><b>Constituency:</b> {escape(constituency)}<br/><b>Ward:</b> {escape(ward)}', meta_style))
+    totals = summary.get('totals') or {}
+    reporting = summary.get('reporting') or {}
+    story.append(Paragraph(
+        f"<b>Deliberate Votes Cast:</b> {to_int(totals.get('candidate_selections')):,} &nbsp;&nbsp; "
+        f"<b>Deliberate Votes Skipped:</b> {to_int(totals.get('skipped')):,} &nbsp;&nbsp; "
+        f"<b>Participants:</b> {to_int(totals.get('participants')):,}<br/>"
+        f"<b>Streams Closed:</b> {to_int(reporting.get('closed_streams')):,} / {to_int(reporting.get('expected_streams')):,}",
+        meta_style
+    ))
+    data = [['Rank', 'Candidate', 'County', 'Votes', 'Share']]
+    candidates = summary.get('candidates') or []
+    if candidates:
+        for i, row in enumerate(candidates, 1):
+            data.append([
+                str(i),
+                Paragraph(escape(str(row.get('candidate') or '')), styles['Normal']),
+                Paragraph(escape(str(row.get('county') or 'County Not Provided')), styles['Normal']),
+                f"{to_int(row.get('votes')):,}",
+                f"{row.get('share', 0)}%",
+            ])
+    else:
+        data.append(['', 'No senatorial candidate selections yet.', '', '0', '0%'])
+    table = Table(data, colWidths=[14*mm, 65*mm, 48*mm, 24*mm, 20*mm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#F3F4F6')),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+        ('FONTNAME',(0,1),(-1,-1),'Helvetica'),
+        ('FONTSIZE',(0,0),(-1,-1),9),
+        ('ALIGN',(0,0),(0,-1),'CENTER'),
+        ('ALIGN',(3,1),(-1,-1),'RIGHT'),
+        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ('GRID',(0,0),(-1,-1),0.35,colors.HexColor('#CCCCCC')),
+        ('BOTTOMPADDING',(0,0),(-1,-1),6),
+        ('TOPPADDING',(0,0),(-1,-1),6),
+    ]))
+    story += [table, Spacer(1, 8*mm), Paragraph('This report is generated from a training/simulation dashboard and does not constitute an official election result.', styles['Italic'])]
+    doc.build(story)
+    return buf.getvalue()
+
+
+def send_results_email(recipient, pdf_bytes, summary):
+    if not SMTP_HOST or not SMTP_FROM_EMAIL:
+        raise RuntimeError('Email service is not configured on this dashboard.')
+    f = summary.get('filters') or {}
+    county = friendly(f.get('county')) or 'All Counties'
+    constituency = friendly(f.get('constituency')) or 'All Constituencies'
+    ward = friendly(f.get('ward')) or 'All Wards'
+    candidate_lines = [
+        f"{i}. {row.get('candidate') or ''} — {row.get('county') or 'County Not Provided'}: "
+        f"{to_int(row.get('votes')):,} votes ({row.get('share', 0)}%)"
+        for i, row in enumerate(summary.get('candidates') or [], 1)
+    ]
+    candidate_results = '\n'.join(candidate_lines) or 'No senatorial candidate selections yet.'
+    msg = EmailMessage()
+    msg['Subject'] = f'Senatorial Simulation Candidate Results — {county}'
+    msg['From'] = f'{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>' if SMTP_FROM_NAME else SMTP_FROM_EMAIL
+    msg['To'] = recipient
+    msg.set_content(
+        'Attached are the current 2027 Senatorial Simulation Candidate Results.\n\n'
+        'TRAINING / SIMULATION ONLY — NON-BINDING\n'
+        f'County: {county}\nConstituency: {constituency}\nWard: {ward}\n\n'
+        f'Candidate Results:\n{candidate_results}\n\n'
+        'This dashboard is for training and simulation only and does not constitute an official election result.'
+    )
+    safe_county = re.sub(r'[^A-Za-z0-9_-]+', '_', county).strip('_') or 'All_Counties'
+    msg.add_attachment(pdf_bytes, maintype='application', subtype='pdf', filename=f'Senatorial_Simulation_Results_{safe_county}.pdf')
+    if SMTP_USE_SSL:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30, context=ssl.create_default_context()) as server:
+            if SMTP_USERNAME:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            if SMTP_USE_TLS:
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+            if SMTP_USERNAME:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+
+
+@app.post('/api/email-results')
+@login_required
+def api_email_results():
+    try:
+        payload = request.get_json(silent=True) or {}
+        recipient = str(payload.get('recipient') or '').strip()
+        if not valid_email(recipient):
+            return jsonify({'error': 'Enter a valid recipient email address.'}), 400
+        summary = build_summary(payload.get('county',''), payload.get('constituency',''), payload.get('ward',''))
+        pdf_bytes = build_results_pdf(summary)
+        send_results_email(recipient, pdf_bytes, summary)
+        return jsonify({'ok': True, 'message': f'Results PDF emailed to {recipient}.'})
+    except Exception as exc:
+        app.logger.exception('Email results failed')
+        return jsonify({'error': str(exc)}), 500
 
 
 @app.get('/api/counties')

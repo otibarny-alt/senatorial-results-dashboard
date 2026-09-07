@@ -32,3 +32,9 @@ V4 FAST STREAM SUBMISSION FILTER
 - Uses local county_main.csv hierarchy to classify every expected stream, including streams that have never opened.
 - Page size is 100 streams to keep browser rendering fast.
 - No new environment variables are required.
+
+V6 EMAIL RESULTS ADDITION
+- Adds Email Results beside Print Results.
+- Generates and attaches a Senatorial Simulation Results PDF.
+- Shows each candidate's county in the dashboard table, printout, PDF and email body.
+- Configure the SMTP variables shown in .env.example on the dashboard service.
