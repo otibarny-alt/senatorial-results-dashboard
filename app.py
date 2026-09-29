@@ -27,7 +27,7 @@ SIMULATION_DASHBOARD_API_KEY = os.getenv('SIMULATION_DASHBOARD_API_KEY', '').str
 COUNTY_MAIN_FILENAME = os.getenv('COUNTY_MAIN_FILENAME', 'county_main.csv').strip()
 AGENTS_LOGIN_FILENAME = os.getenv('AGENTS_LOGIN_FILENAME', 'agents_login.csv').strip()
 CACHE_SECONDS = max(3, int(os.getenv('CACHE_SECONDS', '10')))
-UPSTREAM_TIMEOUT_SECONDS = max(5.0, float(os.getenv('UPSTREAM_TIMEOUT_SECONDS', '30')))
+UPSTREAM_TIMEOUT_SECONDS = max(120.0, float(os.getenv('UPSTREAM_TIMEOUT_SECONDS', '120')))
 AUTH_USERNAME = os.getenv('AUTH_USERNAME', '').strip()
 AUTH_PASSWORD_HASH = os.getenv('AUTH_PASSWORD_HASH', '').strip()
 # Test candidates for this county-based contest are registered in Kisumu.
@@ -71,7 +71,22 @@ def membership_registered(snapshot, county='', constituency='', ward='', poll_st
     if not isinstance(rows, list):
         raise RuntimeError('Voting API has not supplied the Kobo membership-register breakdown.')
     filters = {'county': county, 'constituency': constituency, 'ward': ward, 'poll_station': poll_station}
-    return sum(to_int(row.get('registered_voters')) for row in rows if all(not value or norm(row.get(field)) == norm(value) for field, value in filters.items()))
+    aliases = {}
+    geography = list(load_geo().get('by_stream', {}).values())
+    for field, value in filters.items():
+        if not value:
+            aliases[field] = set()
+            continue
+        accepted = {norm(value), norm(friendly(value))}
+        for geo in geography:
+            pair = {norm(geo.get(field)), norm(geo.get(field + '_label'))}
+            if accepted & pair:
+                accepted.update(pair)
+        accepted.discard('')
+        aliases[field] = accepted
+    return sum(to_int(row.get('registered_voters')) for row in rows
+               if all(not value or norm(row.get(field)) in aliases[field]
+                      for field, value in filters.items()))
 
 
 def candidate_county(record):
