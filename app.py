@@ -60,6 +60,22 @@ def norm(v):
 def geo_key(county, constituency, ward, poll_station, stream):
     return '|'.join((norm(county), norm(constituency), norm(ward), norm(poll_station), norm(stream)))
 
+
+def stream_slot(stream):
+    """Match both full county_main keys and short certified-feed stream labels."""
+    value = norm(stream)
+    match = re.search(r'(?:^|\\s)stream\\s*0*(\\d+)\\s*$', value)
+    if not match:
+        match = re.search(r'(?:^|\\s)0*(\\d+)\\s*$', value)
+    return str(int(match.group(1))) if match else value
+
+
+def stream_status_key(county, constituency, ward, poll_station, stream):
+    return '|'.join((
+        norm(county), norm(constituency), norm(ward), norm(poll_station),
+        stream_slot(stream)
+    ))
+
 def friendly(v):
     text = str(v or '').strip()
     return re.sub(r'\s+', ' ', re.sub(r'[_-]+', ' ', text)).title() if text else ''
@@ -429,7 +445,10 @@ def build_stream_status(county='', constituency='', ward='', submission_status='
 
     live_by_stream = {}
     for row in (snap.get('streams') or []):
-        skey = geo_key(row.get('county'), row.get('constituency'), row.get('ward'), row.get('poll_station'), row.get('stream'))
+        skey = stream_status_key(
+            row.get('county'), row.get('constituency'), row.get('ward'),
+            row.get('poll_station'), row.get('stream')
+        )
         if row.get('stream'):
             live_by_stream[skey] = row
 
@@ -440,7 +459,11 @@ def build_stream_status(county='', constituency='', ward='', submission_status='
 
     for skey in expected:
         g = geo['by_stream'].get(skey, {})
-        live = live_by_stream.get(skey, {})
+        status_key = stream_status_key(
+            g.get('county'), g.get('constituency'), g.get('ward'),
+            g.get('poll_station'), g.get('stream')
+        )
+        live = live_by_stream.get(status_key, {})
         live_status = str(live.get('status') or '').strip().upper()
         submitted = live_status == 'CLOSED'
         if submitted:
