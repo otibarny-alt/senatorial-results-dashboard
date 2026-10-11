@@ -48,6 +48,9 @@ _fetch_lock = threading.Lock()
 _cache = {'snapshot': None, 'snapshot_at': 0.0, 'last_error': ''}
 _geo = None
 _registered = None
+_voter_count_cache = {}
+_voter_count_cache_lock = threading.Lock()
+VOTER_COUNT_CACHE_SECONDS = max(60, int(os.getenv('VOTER_COUNT_CACHE_SECONDS', '600')))
 
 
 def norm(v):
@@ -69,42 +72,74 @@ def to_int(v):
         return 0
 
 def membership_registered(snapshot, county='', constituency='', ward='', poll_station=''):
+    def authoritative_count(selected_constituency='', selected_ward='', selected_station=''):
+        params = {
+            'county': friendly(county),
+            'constituency': friendly(selected_constituency),
+            'ward': friendly(selected_ward),
+            'polling_station': friendly(selected_station),
+        }
+        cache_key = tuple(norm(params[k]) for k in ('county', 'constituency', 'ward', 'polling_station'))
+        now = time.time()
+        with _voter_count_cache_lock:
+            cached = _voter_count_cache.get(cache_key)
+        if cached and now - cached['at'] <= VOTER_COUNT_CACHE_SECONDS:
+            return cached['count']
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = _http.get(
+                    SIMULATION_BASE_URL.rstrip('/') + '/api/voters-register/count',
+                    params=params,
+                    headers={
+                        'X-Dashboard-Key': SIMULATION_DASHBOARD_API_KEY,
+                        'Accept': 'application/json',
+                    },
+                    timeout=(5, 120),
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    if not payload.get('ok'):
+                        raise RuntimeError(payload.get('error') or 'Voters Register count failed.')
+                    count = to_int(payload.get('registered_voters'))
+                    with _voter_count_cache_lock:
+                        _voter_count_cache[cache_key] = {'count': count, 'at': time.time()}
+                    return count
+                last_error = RuntimeError(
+                    'Voters Register count service returned HTTP ' + str(response.status_code) + '.'
+                )
+                if response.status_code not in (502, 503, 504):
+                    break
+            except Exception as exc:
+                last_error = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+
+        if cached:
+            app.logger.warning('Using last successful Voters Register count after upstream failure: %s', last_error)
+            return cached['count']
+        raise last_error or RuntimeError('Voters Register count service did not respond.')
+
     try:
-        return count_registered_voters(county, constituency, ward, poll_station)
+        if constituency or ward or poll_station:
+            return authoritative_count(constituency, ward, poll_station)
+
+        constituency_rows = list(
+            load_geo().get('constituencies_ui', {}).get(norm(county), {}).values()
+        )
+        if constituency_rows:
+            return sum(
+                authoritative_count(str(item.get('value') or ''))
+                for item in constituency_rows
+            )
+        return authoritative_count()
     except Exception as exc:
-        app.logger.warning('Direct PostgreSQL voter count unavailable; using voting API breakdown: %s', exc)
-    response = requests.get(
-        SIMULATION_BASE_URL.rstrip('/') + '/api/voters-register/count',
-        params={'county': county, 'constituency': constituency, 'ward': ward, 'polling_station': poll_station},
-        headers={'X-Dashboard-Key': SIMULATION_DASHBOARD_API_KEY, 'Accept': 'application/json'},
-        timeout=(5, 120),
-    )
-    if response.status_code != 200:
-        raise RuntimeError('Authoritative voters-register count is unavailable; no voter total will be displayed.')
-    payload = response.json()
-    if not payload.get('ok'):
-        raise RuntimeError(payload.get('error') or 'Authoritative voters-register count failed.')
-    return to_int(payload.get('registered_voters'))
-    rows = snapshot.get('registered_voter_breakdown')
-    if not isinstance(rows, list):
-        return 0
-    filters = {'county': county, 'constituency': constituency, 'ward': ward, 'poll_station': poll_station}
-    aliases = {}
-    geography = list(load_geo().get('by_stream', {}).values())
-    for field, value in filters.items():
-        if not value:
-            aliases[field] = set()
-            continue
-        accepted = {norm(value), norm(friendly(value))}
-        for geo in geography:
-            pair = {norm(geo.get(field)), norm(geo.get(field + '_label'))}
-            if accepted & pair:
-                accepted.update(pair)
-        accepted.discard('')
-        aliases[field] = accepted
-    return sum(to_int(row.get('registered_voters')) for row in rows
-               if all(not value or norm(row.get(field)) in aliases[field]
-                      for field, value in filters.items()))
+        app.logger.exception('Authoritative Voters Register count failed')
+        raise RuntimeError(
+            'Registered-voter count could not be read from the authoritative '
+            'Voters Register service. Candidate results remain available.'
+        ) from exc
 
 
 def candidate_county(record):
